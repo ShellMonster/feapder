@@ -93,7 +93,11 @@ class ParserControl(threading.Thread):
                 request_dict = self._collector.get_request()
                 if request_dict:
                     # 非阻塞提交，避免背压导致死锁
-                    self._qps_scheduler.submit(request_dict, block=False)
+                    success = self._qps_scheduler.submit(request_dict, block=False)
+                    if not success:
+                        # 背压触发，把请求放回Collector的待处理队列
+                        self._collector.put_back_request(request_dict)
+                        break
                 else:
                     break
 
@@ -560,7 +564,11 @@ class AirSpiderParserControl(ParserControl):
                 pending_request = self._memory_db.get_nowait()
                 if pending_request:
                     # 非阻塞提交，避免背压导致死锁
-                    self._qps_scheduler.submit(pending_request, block=False)
+                    success = self._qps_scheduler.submit(pending_request, block=False)
+                    if not success:
+                        # 背压触发，把请求放回队列，停止本轮提交
+                        self._memory_db.put_back(pending_request)
+                        break
                 else:
                     break
 

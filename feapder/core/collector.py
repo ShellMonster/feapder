@@ -107,6 +107,18 @@ class Collector(threading.Thread):
         except Empty as e:
             return None
 
+    def put_back_request(self, request_dict):
+        """
+        将请求放回待处理队列（用于QPS背压时归还请求）
+
+        :param request_dict: 请求字典 {"request_obj": Request, "request_redis": str}
+        """
+        try:
+            self._todo_requests.put_nowait(request_dict)
+        except Exception:
+            # 队列满时忽略，请求会通过防丢机制重新下发
+            pass
+
     def get_requests_count(self):
         return (
             self._todo_requests.qsize() or self._db.zget_count(self._tab_requests) or 0
