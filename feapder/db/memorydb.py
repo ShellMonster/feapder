@@ -56,5 +56,20 @@ class MemoryDB:
         except:
             return None
 
+    def put_back(self, item):
+        """
+        将任务放回队列（用于提交失败时归还）
+
+        使用最高优先级（0）确保尽快重新处理。
+
+        :param item: 任务对象
+        """
+        try:
+            # 使用 _put 直接放入，避免阻塞
+            self.priority_queue._put((0, item))
+            self.priority_queue.unfinished_tasks += 1
+        except Exception:
+            pass
+
     def empty(self):
         return self.priority_queue.empty()
