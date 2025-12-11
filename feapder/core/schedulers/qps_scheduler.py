@@ -51,6 +51,40 @@ class QPSScheduler:
     """
     QPS调度器，单线程调度器，负责管理请求的QPS限流
     采用生产者-消费者模式，单线程处理避免令牌桶的并发竞争
+
+    【设计原理】
+    1. QPS限流在"令牌获取阶段"生效（submit → 调度线程）
+    2. 背压在"提交阶段"生效（防止队列堆积）
+    3. 实际处理速率受"消费者速率"限制
+
+    【重要假设】
+    ⚠️ 本调度器假设消费速率足够快（> 最高QPS配置）
+
+    当消费速率 < QPS配置时：
+    - 实际QPS = min(QPS配置, 消费速率)
+    - 例如：QPS配置=10，消费速率=8 → 实际QPS=8
+
+    【多域名场景】
+    1. 各域名共享一个就绪队列和消费者
+    2. 总消费速率被所有域名平均分配
+    3. 例如：消费速率=15/秒，3个域名 → 每个域名约5/秒
+
+    【使用建议】
+    1. max_prefetch 设置为: QPS * 预期响应时间（秒）
+       例如：QPS=10，响应时间=2秒 → max_prefetch=20
+
+    2. 确保消费速率 >= Σ(所有域名QPS)
+       例如：3个域名(QPS=2,5,10) → 消费速率应 >= 17/秒
+
+    3. 对于I/O密集型任务：
+       - 建议使用异步消费（asyncio）
+       - 或使用线程池并行消费
+       - 确保消费不是瓶颈
+
+    【性能保证】
+    - 单域名低QPS（<5）：精度±5%
+    - 单域名中QPS（5-10）：精度±10%，受消费速率影响
+    - 多域名：无法保证精确QPS，总速率受消费限制
     """
 
     def __init__(
@@ -93,6 +127,14 @@ class QPSScheduler:
             'immediate': 0,       # 立即获得令牌的请求数
             'delayed': 0,         # 需要延迟的请求数
             'ready': 0,           # 已就绪的请求数
+        }
+
+        # 消费速率跟踪（用于监控消费速率是否足够）
+        self._consume_tracker = {
+            'last_time': time.time(),
+            'count': 0,
+            'rate': 0.0,  # 当前消费速率（个/秒）
+            'last_warning_time': 0,  # 上次告警时间
         }
 
         # 状态日志控制
@@ -195,6 +237,35 @@ class QPSScheduler:
         """
         try:
             request, domain = self._ready_queue.get(timeout=timeout)
+
+            # 更新消费速率统计
+            now = time.time()
+            self._consume_tracker['count'] += 1
+            elapsed = now - self._consume_tracker['last_time']
+
+            if elapsed >= 1.0:  # 每秒更新一次
+                rate = self._consume_tracker['count'] / elapsed
+                self._consume_tracker['rate'] = rate
+                self._consume_tracker['count'] = 0
+                self._consume_tracker['last_time'] = now
+
+                # 检查是否低于预期（每10秒告警一次，避免刷屏）
+                if now - self._consume_tracker['last_warning_time'] >= 10:
+                    total_expected_qps = sum(
+                        self.rate_limiter.get_qps_limit(d)
+                        for d in self._domain_pending_count.keys()
+                        if self._domain_pending_count[d] > 0
+                    )
+                    if total_expected_qps > 0 and rate < total_expected_qps * 0.8:
+                        log.warning(
+                            f"⚠️ QPS调度器: 消费速率不足! "
+                            f"实际={rate:.1f}/秒, "
+                            f"预期>={total_expected_qps:.1f}/秒 "
+                            f"(所有活跃域名QPS总和). "
+                            f"建议: 提高消费速率或降低QPS配置"
+                        )
+                        self._consume_tracker['last_warning_time'] = now
+
             # 减少域名计数
             with self._count_lock:
                 self._domain_pending_count[domain] = max(
@@ -219,6 +290,40 @@ class QPSScheduler:
             return request
         except Empty:
             return None
+
+    def put_back(self, request: Any) -> bool:
+        """
+        @summary: 将请求放回调度器
+                  适用于处理失败需要重试的请求，或被背压拒绝后需要恢复的请求
+        ---------
+        @param request: 请求对象（需有url属性）或字典（分布式爬虫格式）
+        ---------
+        @result: 放回成功返回True，达到背压上限返回False
+        """
+        # 提取域名，支持两种格式
+        if isinstance(request, dict) and 'request_obj' in request:
+            url = getattr(request['request_obj'], 'url', '') or ''
+        else:
+            url = getattr(request, 'url', '') or ''
+        domain = DomainRateLimiter.extract_domain(url)
+
+        # 检查背压限制
+        if self.max_prefetch > 0:
+            with self._count_lock:
+                if self._domain_pending_count[domain] >= self.max_prefetch:
+                    log.debug(
+                        f"put_back失败: 域名 {domain} 待处理数达到上限 {self.max_prefetch}"
+                    )
+                    return False
+                self._domain_pending_count[domain] += 1
+        else:
+            with self._count_lock:
+                self._domain_pending_count[domain] += 1
+
+        # 放回提交队列，重新经过QPS控制流程
+        self._submit_queue.put((request, domain))
+        log.debug(f"put_back成功: 域名 {domain}, 待处理数={self._domain_pending_count[domain]}")
+        return True
 
     def _scheduler_loop(self) -> None:
         """
@@ -305,6 +410,14 @@ class QPSScheduler:
 
         return count
 
+    def get_consume_rate(self) -> float:
+        """
+        @summary: 获取当前消费速率（个/秒）
+        ---------
+        @result: 当前消费速率
+        """
+        return self._consume_tracker['rate']
+
     def _log_status_if_needed(self) -> None:
         """
         @summary: 定期输出调度器状态日志（DEBUG模式下）
@@ -320,12 +433,14 @@ class QPSScheduler:
 
             submit_queue_size = self._submit_queue.qsize()
             ready_queue_size = self._ready_queue.qsize()
+            consume_rate = self.get_consume_rate()
 
             # 只有当有请求在处理时才输出日志
             if delay_heap_size > 0 or submit_queue_size > 0 or ready_queue_size > 0:
                 log.debug(
                     f"QPS调度器状态: 提交队列={submit_queue_size}, "
                     f"延迟堆={delay_heap_size}, 就绪队列={ready_queue_size}, "
+                    f"消费速率={consume_rate:.1f}/秒, "
                     f"统计={self._stats}"
                 )
 
