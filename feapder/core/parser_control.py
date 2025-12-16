@@ -40,6 +40,9 @@ class ParserControl(threading.Thread):
 
     _hook_parsers = set()
 
+    # 类级别的限速器（所有线程共享）
+    _rate_limiter = None
+
     def __init__(self, collector, redis_key, request_buffer, item_buffer):
         super(ParserControl, self).__init__()
         self._parsers = []
@@ -49,6 +52,11 @@ class ParserControl(threading.Thread):
         self._item_buffer = item_buffer
 
         self._thread_stop = False
+
+        # 初始化限速器（类级别单例，分布式使用Redis漏桶）
+        if setting.DOMAIN_RATE_LIMIT_ENABLE and self.__class__._rate_limiter is None:
+            from feapder.utils.rate_limiter import DomainRateLimiter
+            self.__class__._rate_limiter = DomainRateLimiter()
 
     def run(self):
         self._thread_stop = False
@@ -78,8 +86,18 @@ class ParserControl(threading.Thread):
         response = None
         request_redis = request["request_redis"]
         request = request["request_obj"]
-        # 注入request_buffer，用于QPS限制时将请求放回队列
-        request._request_buffer = self._request_buffer
+
+        # QPS限制检查（在处理请求前）
+        if setting.DOMAIN_RATE_LIMIT_ENABLE and self.__class__._rate_limiter:
+            from feapder.utils.rate_limiter import DomainRateLimiter
+            domain = DomainRateLimiter.extract_domain(request.url)
+            if domain:
+                wait_time = self.__class__._rate_limiter.acquire_for_domain(request, domain)
+                if wait_time > 0:
+                    log.debug(
+                        f"[QPS限制] 域名 {domain} 需等待 {wait_time:.3f}秒"
+                    )
+                    time.sleep(wait_time)
 
         del_request_redis_after_item_to_db = False
         del_request_redis_after_request_to_db = False
@@ -461,6 +479,9 @@ class AirSpiderParserControl(ParserControl):
     _success_task_count = 0
     _failed_task_count = 0
 
+    # 类级别的限速器（所有线程共享）
+    _rate_limiter = None
+
     def __init__(
         self,
         *,
@@ -474,6 +495,11 @@ class AirSpiderParserControl(ParserControl):
         self._thread_stop = False
         self._request_buffer = request_buffer
         self._item_buffer = item_buffer
+
+        # 初始化限速器（类级别单例）
+        if setting.DOMAIN_RATE_LIMIT_ENABLE and self.__class__._rate_limiter is None:
+            from feapder.utils.rate_limiter import DomainRateLimiter
+            self.__class__._rate_limiter = DomainRateLimiter()
 
     def run(self):
         while not self._thread_stop:
@@ -493,6 +519,18 @@ class AirSpiderParserControl(ParserControl):
 
     def deal_request(self, request):
         response = None
+
+        # QPS限制检查（在处理请求前）
+        if setting.DOMAIN_RATE_LIMIT_ENABLE and self.__class__._rate_limiter:
+            from feapder.utils.rate_limiter import DomainRateLimiter
+            domain = DomainRateLimiter.extract_domain(request.url)
+            if domain:
+                wait_time = self.__class__._rate_limiter.acquire_for_domain(request, domain)
+                if wait_time > 0:
+                    log.debug(
+                        f"[QPS限制] 域名 {domain} 需等待 {wait_time:.3f}秒"
+                    )
+                    time.sleep(wait_time)
 
         for parser in self._parsers:
             if parser.name == request.parser_name:

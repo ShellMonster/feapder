@@ -2,7 +2,7 @@
 """
 Created on 2025-11-19
 ---------
-@summary: 域名级QPS限制器（令牌桶算法）
+@summary: 域名级QPS限制器（漏桶算法）
 ---------
 @author: feapder
 """
@@ -10,107 +10,115 @@ Created on 2025-11-19
 import time
 import threading
 from typing import Dict
+from urllib.parse import urlparse
 
 import feapder.setting as setting
 from feapder.db.redisdb import RedisDB
 from feapder.utils.log import log
 
 
-class LocalTokenBucket:
+class LocalLeakyBucket:
     """
-    本地内存版令牌桶
+    本地内存版漏桶
 
+    严格匀速控制，不允许突发流量
     用于AirSpider（单机爬虫）
     线程安全，适用于多线程环境
     """
 
     def __init__(self, qps: int):
         """
-        初始化令牌桶
+        初始化漏桶
 
         Args:
             qps: 每秒允许的请求数（Queries Per Second）
         """
-        self.capacity = qps  # 桶容量（最大令牌数）
-        self.tokens = float(qps)  # 当前令牌数
-        self.qps = qps  # 每秒生成的令牌数
-        self.last_update = time.time()  # 上次更新时间
-        self.lock = threading.Lock()  # 线程锁
+        self.qps = qps
+        self.interval = 1.0 / qps  # 两次请求的最小间隔（秒）
+        self.last_time = 0.0  # 上次请求时间
+        self.lock = threading.Lock()
 
     def acquire(self) -> float:
         """
-        尝试获取一个令牌
+        尝试获取通行权
 
         Returns:
-            float: 0表示成功获取令牌，>0表示需要等待的秒数
+            float: 0表示可以立即通行，>0表示需要等待的秒数
         """
         with self.lock:
             now = time.time()
-            elapsed = now - self.last_update  # 时间流逝
+            next_allowed = self.last_time + self.interval
 
-            # 根据时间流逝补充令牌
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.qps)
-            self.last_update = now
-
-            # 尝试消费一个令牌
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return 0  # 成功
+            if now >= next_allowed:
+                # 可以立即通行
+                self.last_time = now
+                return 0
             else:
-                # 计算需要等待多久才能获得令牌
-                wait_time = (1 - self.tokens) / self.qps
+                # 需要等待，预占下一个时间槽
+                wait_time = next_allowed - now
+                self.last_time = next_allowed
                 return wait_time
 
 
-class RedisTokenBucket:
+class RedisLeakyBucket:
     """
-    Redis分布式令牌桶
+    Redis分布式漏桶
 
+    严格匀速控制，不允许突发流量
     用于Spider/TaskSpider/BatchSpider（分布式爬虫）
     使用Lua脚本保证原子性，支持多机器共享QPS配额
     """
 
-    # Lua脚本：原子性地检查并消费令牌
+    # Lua脚本：原子性地检查并获取通行权
+    # 关键：每次请求都预占一个时间槽，确保多机器分布式场景下严格限流
+    # 修复：使用 max(now, last_scheduled + interval) 确保严格的时间间隔
     ACQUIRE_SCRIPT = """
     local key = KEYS[1]
-    local capacity = tonumber(ARGV[1])
-    local qps = tonumber(ARGV[2])
-    local now = tonumber(ARGV[3])
+    local interval = tonumber(ARGV[1])
+    local now = tonumber(ARGV[2])
 
-    -- 获取当前令牌数和上次更新时间
-    local tokens = tonumber(redis.call('HGET', key, 'tokens'))
-    local last_update = tonumber(redis.call('HGET', key, 'last_update'))
+    -- 获取上次预占的时间槽（不存在则返回nil）
+    local last_scheduled_str = redis.call('GET', key)
+    local last_scheduled = last_scheduled_str and tonumber(last_scheduled_str) or nil
 
-    -- 如果是第一次访问，初始化
-    if not tokens then
-        tokens = capacity
-    end
-    if not last_update then
-        last_update = now
-    end
-
-    -- 计算应该补充的令牌数
-    local elapsed = now - last_update
-    tokens = math.min(capacity, tokens + elapsed * qps)
-
-    -- 尝试消费一个令牌
-    if tokens >= 1 then
-        -- 有令牌，消费一个
-        tokens = tokens - 1
-        redis.call('HSET', key, 'tokens', tostring(tokens))
-        redis.call('HSET', key, 'last_update', tostring(now))
-        redis.call('EXPIRE', key, 3600)  -- 1小时无访问自动清理
-        return 0  -- 成功
+    -- 计算本次请求应该被调度的时间
+    -- 关键：scheduled_time = max(now, last_scheduled + interval)
+    -- 这确保了：
+    -- 1. 如果空闲很久，可以立即执行（now > last + interval）
+    -- 2. 如果有并发请求，严格按interval排队（last + interval > now）
+    local scheduled_time
+    if last_scheduled == nil then
+        -- 首次请求，立即执行
+        scheduled_time = now
     else
-        -- 无令牌，计算需要等待的时间
-        local wait_time = (1 - tokens) / qps
-        return wait_time
+        -- 计算下一个可用时间槽
+        local next_slot = last_scheduled + interval
+        -- 选择较大的值：要么现在执行，要么排队到下一个时间槽
+        if now > next_slot then
+            scheduled_time = now
+        else
+            scheduled_time = next_slot
+        end
     end
+
+    -- 计算需要等待的时间
+    local wait_time = scheduled_time - now
+    if wait_time < 0 then
+        wait_time = 0
+    end
+
+    -- 预占这个时间槽（无论是否需要等待）
+    -- 使用 string.format 保留足够的精度（6位小数）
+    redis.call('SET', key, string.format('%.6f', scheduled_time))
+    redis.call('EXPIRE', key, 3600)
+
+    -- 返回字符串格式保留精度（Redis会将浮点数截断为整数）
+    return string.format('%.6f', wait_time)
     """
 
     def __init__(self, redis_db: RedisDB, rate_limit_key: str, qps: int):
         """
-        初始化Redis令牌桶
+        初始化Redis漏桶
 
         Args:
             redis_db: RedisDB实例
@@ -120,7 +128,7 @@ class RedisTokenBucket:
         self.redis = redis_db._redis
         self.rate_limit_key = rate_limit_key
         self.qps = qps
-        self.capacity = qps
+        self.interval = 1.0 / qps  # 两次请求的最小间隔（秒）
         self.acquire_sha = None  # Lua脚本的SHA值（延迟加载）
 
     def _ensure_script_loaded(self):
@@ -134,10 +142,10 @@ class RedisTokenBucket:
 
     def acquire(self) -> float:
         """
-        尝试获取一个令牌
+        尝试获取通行权
 
         Returns:
-            float: 0表示成功获取令牌，>0表示需要等待的秒数
+            float: 0表示可以立即通行，>0表示需要等待的秒数
         """
         try:
             self._ensure_script_loaded()
@@ -148,16 +156,15 @@ class RedisTokenBucket:
                 self.acquire_sha,
                 1,  # KEYS数量
                 self.rate_limit_key,  # KEYS[1]
-                self.capacity,  # ARGV[1]
-                self.qps,  # ARGV[2]
-                now,  # ARGV[3]
+                self.interval,  # ARGV[1]
+                now,  # ARGV[2]
             )
 
             return float(wait_time)
 
         except Exception as e:
             # Redis异常时放行请求，避免阻塞爬虫
-            log.error(f"Redis令牌桶异常: {e}, 放行请求")
+            log.error(f"Redis漏桶异常: {e}, 放行请求")
             return 0
 
 
@@ -165,9 +172,12 @@ class DomainRateLimiter:
     """
     域名级QPS限制器（统一管理器）
 
+    采用漏桶算法，严格匀速控制，不允许突发流量
+    适合爬虫场景，避免突发请求导致被封IP
+
     职责:
     1. 自动检测Spider类型（AirSpider或分布式Spider）
-    2. 为每个域名创建对应的令牌桶（本地或Redis）
+    2. 为每个域名创建对应的漏桶（本地或Redis）
     3. 提供统一的acquire接口
     """
 
@@ -175,7 +185,10 @@ class DomainRateLimiter:
         """
         初始化限速器
 
-        自动检测是否使用Redis（判断是否为分布式爬虫）
+        Args:
+            rules: QPS规则，格式: {"baidu.com": 5, "*.google.com": 8}
+            default_qps: 默认QPS限制，0表示不限制
+            storage: 存储类型，"local"/"memory" 或 "redis"，默认从setting读取或自动检测
         """
         self.rules = rules or getattr(setting, "DOMAIN_RATE_LIMIT_RULES", {}) or {}
         self.default_qps = (
@@ -183,12 +196,13 @@ class DomainRateLimiter:
             if default_qps is not None
             else getattr(setting, "DOMAIN_RATE_LIMIT_DEFAULT", 0)
         )
-        self.storage = storage
+        # 优先使用传入的storage，否则从setting读取
+        self.storage = storage or getattr(setting, "DOMAIN_RATE_LIMIT_STORAGE", "auto")
 
-        self.local_buckets: Dict[str, LocalTokenBucket] = {}  # 本地令牌桶缓存
-        self.redis_buckets: Dict[str, RedisTokenBucket] = {}  # Redis令牌桶缓存
+        self.local_buckets: Dict[str, LocalLeakyBucket] = {}  # 本地漏桶缓存
+        self.redis_buckets: Dict[str, RedisLeakyBucket] = {}  # Redis漏桶缓存
         self.redis_db = None  # Redis连接（延迟初始化）
-        self.use_redis = self._should_use_redis(storage)  # 是否使用Redis
+        self.use_redis = self._should_use_redis(self.storage)  # 是否使用Redis
 
     def _should_use_redis(self, storage: str = None) -> bool:
         """
@@ -242,40 +256,40 @@ class DomainRateLimiter:
         # 使用setting中定义的模板
         return setting.TAB_RATE_LIMIT.format(redis_key=redis_key, domain=domain)
 
-    def _get_local_bucket(self, domain: str, qps: int) -> LocalTokenBucket:
+    def _get_local_bucket(self, domain: str, qps: int) -> LocalLeakyBucket:
         """
-        获取本地令牌桶（缓存）
+        获取本地漏桶（缓存）
 
         Args:
             domain: 域名
             qps: QPS限制
 
         Returns:
-            LocalTokenBucket: 本地令牌桶实例
+            LocalLeakyBucket: 本地漏桶实例
         """
         cache_key = f"{domain}:{qps}"
 
         if cache_key not in self.local_buckets:
-            self.local_buckets[cache_key] = LocalTokenBucket(qps)
+            self.local_buckets[cache_key] = LocalLeakyBucket(qps)
 
         return self.local_buckets[cache_key]
 
-    def _get_redis_bucket(self, rate_limit_key: str, qps: int) -> RedisTokenBucket:
+    def _get_redis_bucket(self, rate_limit_key: str, qps: int) -> RedisLeakyBucket:
         """
-        获取Redis令牌桶（缓存）
+        获取Redis漏桶（缓存）
 
         Args:
             rate_limit_key: Redis key
             qps: QPS限制
 
         Returns:
-            RedisTokenBucket: Redis令牌桶实例
+            RedisLeakyBucket: Redis漏桶实例
         """
         cache_key = f"{rate_limit_key}:{qps}"
 
         if cache_key not in self.redis_buckets:
             redis_db = self._get_redis_db()
-            self.redis_buckets[cache_key] = RedisTokenBucket(
+            self.redis_buckets[cache_key] = RedisLeakyBucket(
                 redis_db, rate_limit_key, qps
             )
 
@@ -319,9 +333,9 @@ class DomainRateLimiter:
 
     def acquire(self, request, domain: str, qps_limit: int) -> float:
         """
-        尝试获取令牌（统一入口）
+        尝试获取通行权（统一入口）
 
-        根据Spider类型自动选择本地或Redis令牌桶
+        根据Spider类型自动选择本地或Redis漏桶
 
         Args:
             request: 请求对象
@@ -335,18 +349,45 @@ class DomainRateLimiter:
             return 0
 
         if self.use_redis:
-            # 使用Redis分布式令牌桶
+            # 使用Redis分布式漏桶
             rate_limit_key = self._get_rate_limit_key(request, domain)
             bucket = self._get_redis_bucket(rate_limit_key, qps_limit)
         else:
-            # 使用本地内存令牌桶
+            # 使用本地内存漏桶
             bucket = self._get_local_bucket(domain, qps_limit)
 
         return bucket.acquire()
 
     def acquire_for_domain(self, request, domain: str) -> float:
         """
-        按配置规则自动获取指定域名的令牌
+        按配置规则自动获取指定域名的通行权
         """
         qps_limit = self.get_qps_limit(domain)
         return self.acquire(request, domain, qps_limit)
+
+    @staticmethod
+    def extract_domain(url: str) -> str:
+        """
+        从URL提取域名
+
+        Args:
+            url: 完整URL
+
+        Returns:
+            str: 域名，提取失败返回空字符串
+        """
+        if not url:
+            return ""
+
+        try:
+            parsed = urlparse(url)
+            domain = parsed.hostname or parsed.netloc
+
+            # 去除端口号
+            if domain and ":" in domain:
+                domain = domain.split(":")[0]
+
+            return domain or ""
+        except Exception as e:
+            log.error(f"域名提取失败: {url}, 错误: {e}")
+            return ""

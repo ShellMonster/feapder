@@ -14,8 +14,7 @@ TAB_SPIDER_STATUS = "{redis_key}:h_spider_status"
 # 用户池
 TAB_USER_POOL = "{redis_key}:h_{user_type}_pool"
 # 域名级QPS限制相关表名
-TAB_RATE_LIMIT = "{redis_key}:h_rate_limit:{domain}"  # 单个域名的令牌桶状态
-TAB_RATE_LIMIT_CONFIG = "{redis_key}:h_rate_limit_config"  # 用户配置的QPS规则
+TAB_RATE_LIMIT = "{redis_key}:h_rate_limit:{domain}"  # 单个域名的漏桶状态
 
 # MYSQL
 MYSQL_IP = os.getenv("MYSQL_IP")
@@ -232,6 +231,9 @@ METRICS_OTHER_ARGS = dict(retention_policy_duration="180d", emit_interval=60)
 DOMAIN_RATE_LIMIT_ENABLE = False  # 是否启用域名级QPS限制，默认关闭
 DOMAIN_RATE_LIMIT_DEFAULT = 0  # 默认不限制（0表示不限制，只有在RULES中配置的域名才会被限制）
 DOMAIN_RATE_LIMIT_RULES = {}  # 特定域名的QPS规则，格式: {"baidu.com": 5, "*.google.com": 8}
+# 存储方式: "auto"(默认，有Redis配置则用Redis，否则用本地内存), "redis"(强制Redis), "local"(强制本地内存)
+# 说明: AirSpider单机爬虫一般不配置Redis，自动使用本地内存; 分布式Spider配置了Redis则自动使用Redis
+DOMAIN_RATE_LIMIT_STORAGE = "auto"
 
 ############# 导入用户自定义的setting #############
 try:
