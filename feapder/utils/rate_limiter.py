@@ -171,24 +171,39 @@ class DomainRateLimiter:
     3. 提供统一的acquire接口
     """
 
-    def __init__(self):
+    def __init__(self, rules: Dict[str, int] = None, default_qps: int = None, storage: str = None):
         """
         初始化限速器
 
         自动检测是否使用Redis（判断是否为分布式爬虫）
         """
+        self.rules = rules or getattr(setting, "DOMAIN_RATE_LIMIT_RULES", {}) or {}
+        self.default_qps = (
+            default_qps
+            if default_qps is not None
+            else getattr(setting, "DOMAIN_RATE_LIMIT_DEFAULT", 0)
+        )
+        self.storage = storage
+
         self.local_buckets: Dict[str, LocalTokenBucket] = {}  # 本地令牌桶缓存
         self.redis_buckets: Dict[str, RedisTokenBucket] = {}  # Redis令牌桶缓存
         self.redis_db = None  # Redis连接（延迟初始化）
-        self.use_redis = self._should_use_redis()  # 是否使用Redis
+        self.use_redis = self._should_use_redis(storage)  # 是否使用Redis
 
-    def _should_use_redis(self) -> bool:
+    def _should_use_redis(self, storage: str = None) -> bool:
         """
         判断是否应该使用Redis
 
         Returns:
             bool: True表示使用Redis（分布式爬虫），False表示使用本地内存（AirSpider）
         """
+        if storage:
+            storage = storage.lower()
+            if storage in ("local", "memory"):
+                return False
+            if storage == "redis":
+                return True
+
         # 检查是否配置了Redis连接
         if hasattr(setting, "REDISDB_IP_PORTS") and setting.REDISDB_IP_PORTS:
             return True
@@ -266,6 +281,42 @@ class DomainRateLimiter:
 
         return self.redis_buckets[cache_key]
 
+    def get_qps_limit(self, domain: str) -> int:
+        """
+        获取域名的QPS限制
+
+        规则优先级:
+        1. 精确匹配（含www域名）
+        2. 通配符匹配（*.example.com）
+        3. www回退（www.example.com -> example.com）
+        4. 默认值
+        """
+        if not domain:
+            return 0
+
+        rules = self.rules or {}
+
+        if domain in rules:
+            return rules[domain]
+
+        # 通配符匹配
+        for pattern, qps in rules.items():
+            if pattern.startswith("*."):
+                suffix = pattern[2:]
+                if domain.endswith("." + suffix):
+                    return qps
+
+        # www回退
+        if domain.startswith("www."):
+            domain_without_www = domain[4:]
+            if domain_without_www in rules:
+                return rules[domain_without_www]
+            for pattern, qps in rules.items():
+                if pattern.startswith("*.") and domain_without_www.endswith("." + pattern[2:]):
+                    return qps
+
+        return self.default_qps
+
     def acquire(self, request, domain: str, qps_limit: int) -> float:
         """
         尝试获取令牌（统一入口）
@@ -280,6 +331,9 @@ class DomainRateLimiter:
         Returns:
             float: 0表示成功，>0表示需要等待的秒数
         """
+        if qps_limit is None or qps_limit <= 0:
+            return 0
+
         if self.use_redis:
             # 使用Redis分布式令牌桶
             rate_limit_key = self._get_rate_limit_key(request, domain)
@@ -289,3 +343,10 @@ class DomainRateLimiter:
             bucket = self._get_local_bucket(domain, qps_limit)
 
         return bucket.acquire()
+
+    def acquire_for_domain(self, request, domain: str) -> float:
+        """
+        按配置规则自动获取指定域名的令牌
+        """
+        qps_limit = self.get_qps_limit(domain)
+        return self.acquire(request, domain, qps_limit)
